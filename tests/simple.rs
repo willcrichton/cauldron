@@ -42,8 +42,8 @@ fn ifthen() {
 fn closure() {
     auto_gc! {
         let x = 1;
-        let y = |z: i32| { x + z };
-        let z = y(x);
+        let y = |a: i32, b: i32| { x + a + b };
+        let z = y(x, 1);
     };
-    assert_eq!(*z, 2);
+    assert_eq!(*z, 3);
 }

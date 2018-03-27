@@ -23,7 +23,6 @@ use rustc_metadata::cstore::CStore;
 use rustc_driver::driver;
 use rustc_resolve::MakeGlobMap;
 use syntax::{ext, ast};
-use syntax::ast::DUMMY_NODE_ID;
 use syntax_pos::DUMMY_SP;
 use syntax::ptr::P;
 use syntax::print::pprust;
@@ -59,6 +58,7 @@ macro_rules! impl_to_tokens_slice {
 
 impl_to_tokens_slice! { P<ast::Pat>, [TokenTree::Token(DUMMY_SP, token::Comma)] }
 impl_to_tokens_slice! { P<ast::Expr>, [TokenTree::Token(DUMMY_SP, token::Comma)] }
+impl_to_tokens_slice! { P<ast::Ty>, [TokenTree::Token(DUMMY_SP, token::Comma)] }
 
 
 // NOTE: if you are seeing "error[E0463]: can't find crate for `std`"
@@ -122,7 +122,7 @@ impl<'a, 'tcx: 'a, 'ecx> TestFolder<'a, 'tcx, 'ecx> {
     quote_ty!(&self.ecx, Rc<$ty>)
   }
 
-  fn unwrap_rc(&self, ty: &P<ast::Ty>) -> P<ast::Ty> {
+  fn unwrap_ty_container(&self, ty: &P<ast::Ty>) -> P<ast::Ty> {
     bind!{let ast::TyKind::Path(_, ref segs) = ty.node;}
     let seg = &segs.segments[0];
     bind!{let Some(ref segparams) = seg.parameters;}
@@ -130,12 +130,12 @@ impl<'a, 'tcx: 'a, 'ecx> TestFolder<'a, 'tcx, 'ecx> {
     params.types[0].clone()
   }
 
-  fn unwrap_fn(&self, ty: &P<ast::Ty>) -> (Vec<P<ast::Ty>>, P<ast::Ty>) {
+  fn unwrap_ty_function(&self, ty: &P<ast::Ty>) -> (P<ast::Ty>, P<ast::Ty>) {
     bind!{let ast::TyKind::Path(_, ref segs) = ty.node;}
     let seg = &segs.segments[0];
     bind!{let Some(ref segparams) = seg.parameters;}
     bind!{let ast::PathParameters::Parenthesized(ref params) = **segparams;}
-    (params.inputs.clone(),
+    (params.inputs.clone().into_iter().nth(0).unwrap(),
      params.output.clone().unwrap_or_else(|| quote_ty!(&self.ecx, ())))
   }
 }
@@ -148,7 +148,7 @@ impl<'a, 'tcx: 'a, 'ecx> Folder<'tcx> for TestFolder<'a, 'tcx, 'ecx> {
 
       Expr_::ExprPath(QPath::Resolved(_, ref path)) => {
         let ident = Ident::with_empty_ctxt(path.segments[0].name);
-        quote_expr!(&self.ecx, *$ident)
+        return quote_expr!(&self.ecx, $ident.clone());
       }
 
       Expr_::ExprBinary(ref binop, ref e1, ref e2) => {
@@ -200,20 +200,22 @@ impl<'a, 'tcx: 'a, 'ecx> Folder<'tcx> for TestFolder<'a, 'tcx, 'ecx> {
         let krate = &self.tcx.hir.krate();
         let body = krate.body(body_id);
         let ty = self.convert_type(self.get_type(expr));
-        let fnty = self.unwrap_rc(&ty);
-        let (input_tys, output_ty) = self.unwrap_fn(&fnty);
-        let input_tup = &input_tys[0];
-        let input_tys = self.unwrap_rc(input_tup);
-        bind!{let ast::TyKind::Tup(ref input_tys) = input_tys.node;}
-        let input_tys: Vec<ast::Ty> =
-          input_tys.clone().into_iter().map(|ty| ty.into_inner()).collect();
-        let input_tys: &[ast::Ty] = &input_tys;
+        let fnty = self.unwrap_ty_container(&self.unwrap_ty_container(&ty));
+        let (input_ty, output_ty) = self.unwrap_ty_function(&fnty);
+        let input_tup = self.unwrap_ty_container(&input_ty);
 
         let args: Vec<P<ast::Pat>> =
           body.arguments.iter()
-          .map(|arg| { self.fold_pat(&arg.pat) })
-          .zip(input_tys.iter())
-          .map(|(pat, ty)| { quote_pat!(&self.ecx, $pat : $ty) })
+          .map(|arg| {
+            let pat = self.fold_pat(&arg.pat);
+            bind!{let ast::PatKind::Ident(_, ref ident, _) = pat.node;}
+            let mut pat = pat.clone().into_inner();;
+            pat.node = ast::PatKind::Ident(
+              ast::BindingMode::ByRef(ast::Mutability::Immutable),
+              ident.clone(),
+              None);
+            P(pat)
+          })
           .collect();
         let args: SliceWrapper<P<ast::Pat>> = SliceWrapper(args);
         let body_expr = self.fold_expr(&body.value);
@@ -221,31 +223,10 @@ impl<'a, 'tcx: 'a, 'ecx> Folder<'tcx> for TestFolder<'a, 'tcx, 'ecx> {
 
         quote_expr!(
           &self.ecx,
-          Box::new(|__arg : $input_tup| -> $output_ty {
-            let $arg : ($input_tys) = *__arg;
+          Box::new(|__arg : $input_ty| -> $output_ty {
+            let $arg : ($input_tup) = *__arg;
             $body_expr
           }))
-
-        // let fn_decl = ast::FnDecl {
-        //   inputs: panic!(),
-        //   output: ast::FunctionRetTy::Ty(output_ty),
-        //   variadic: false
-        // };
-        // println!("b");
-
-        // let closure = ast::ExprKind::Closure(
-        //   ast::CaptureBy::Value,
-        //   ast::Movability::Movable,
-        //   P(fn_decl),
-        //   body_expr,
-        //   DUMMY_SP);
-
-        // P(ast::Expr {
-        //   id: DUMMY_NODE_ID,
-        //   node: closure,
-        //   span: DUMMY_SP,
-        //   attrs: syntax::util::ThinVec::new()
-        // })
       }
       _ => panic!("fold_expr: Not yet implemented"),
     };
